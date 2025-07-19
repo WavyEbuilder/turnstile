@@ -38,6 +38,11 @@ option('manage_rundir',
     description: 'Whether to manage rundir by default'
 )
 
+option('support_selinux',
+    type: 'feature', value: 'auto',
+    description: 'Whether to support SELinux',
+)
+
 option('man',
     type: 'boolean', value: true,
     description: 'Whether to generate manpages'

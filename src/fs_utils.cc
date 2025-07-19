@@ -10,11 +10,59 @@
 
 #include "turnstiled.hh"
 
+#ifdef HAVE_SELINUX
+#include <selinux/label.h>
+#include <selinux/selinux.h>
+#endif
+
 int dir_make_at(int dfd, char const *dname, mode_t mode) {
     int sdfd = openat(dfd, dname, O_RDONLY | O_NOFOLLOW);
     struct stat st;
     int reterr = 0;
     int omask = umask(0);
+
+#ifdef HAVE_SELINUX
+    // We can't rely on policy transitions to set the user field of the context
+    // correctly as that depends on the seuser db, so calculate the context to
+    // create the runtimedir with ourselves.
+    char *path = nullptr;
+    char *context = nullptr;
+    {
+        // 10 for digits of an int, 1 for nullterm.
+        char procfd[strlen("/proc/self/fd/") + 10 + 1];
+        ssize_t len;
+        snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", dfd);
+        char dfd_path[PATH_MAX];
+        len = readlink(procfd, dfd_path, sizeof(dfd_path)-1);
+        if (len < 0) {
+            goto ret_err;
+        }
+        dfd_path[len] = '\0';
+        path = (char *)malloc(strlen(dfd_path) + 1 + strlen(dname) + 2);
+        if (!path) {
+            goto ret_err;
+        }
+        sprintf(path, "%s/%s", dfd_path, dname);
+
+        struct selabel_handle *sehandle =
+            selabel_open(SELABEL_CTX_FILE, nullptr, 0);
+        if (!sehandle) {
+            perror("selabel_open");
+            goto ret_err;
+        }
+        if (selabel_lookup_raw(sehandle, &context, path, mode) < 0) {
+            perror("selabel_lookup_raw");
+            selabel_close(sehandle);
+            goto ret_err;
+        }
+        selabel_close(sehandle);
+        if (setfscreatecon_raw(context) < 0) {
+            perror("setfscreatecon_raw");
+            goto ret_err;
+        }
+    }
+#endif
+
     if (fstat(sdfd, &st) || !S_ISDIR(st.st_mode)) {
         close(sdfd);
         if (mkdirat(dfd, dname, mode)) {
@@ -34,14 +82,49 @@ int dir_make_at(int dfd, char const *dname, mode_t mode) {
         if ((fchmod(sdfd, mode) < 0) || ((nfd = dup(sdfd)) < 0)) {
             goto ret_err;
         }
+
+#ifdef HAVE_SELINUX
+        if (lsetfilecon(path, context) < 0) {
+            perror("lsetfilecon");
+            goto ret_err;
+        }
+#endif
+
         if (!dir_clear_contents(nfd)) {
             reterr = ENOTEMPTY;
             goto ret_err;
         }
     }
+
+#ifdef HAVE_SELINUX
+    // Reset fs creation context so new objects are labelled correctly.
+    if (setfscreatecon(nullptr) < 0) {
+        perror("setfscreatecon");
+        goto ret_err;
+    }
+    if (context) {
+        free(context);
+    }
+    if (path) {
+        free(path);
+    }
+#endif
+
     umask(omask);
     return sdfd;
+
 ret_err:
+#ifdef HAVE_SELINUX
+    if (setfscreatecon(nullptr) < 0) {
+        perror("setfscreatecon");
+    }
+    if (context) {
+        free(context);
+    }
+    if (path) {
+        free(path);
+    }
+#endif
     umask(omask);
     if (sdfd >= 0) {
         close(sdfd);
@@ -97,6 +180,44 @@ bool rundir_make(char *rundir, unsigned int uid, unsigned int gid) {
         sl = std::strchr(dirbase, '/');
     }
     umask(omask);
+
+#ifdef HAVE_SELINUX
+    // We can't rely on policy transitions to set the user field of the context
+    // correctly as that depends on the seuser db, so calculate the context to
+    // create the runtimedir with ourselves.
+    char *context = nullptr;
+    {
+        struct selabel_handle *sehandle =
+            selabel_open(SELABEL_CTX_FILE, nullptr, 0);
+        if (!sehandle) {
+            print_err(
+                "rundir: failed to make rundir %s (%s)",
+                rundir, strerror(errno)
+            );
+            close(bfd);
+            return false;
+        }
+        if (selabel_lookup_raw(sehandle, &context, rundir, 0700) < 0) {
+            print_err(
+                "rundir: failed to make rundir %s (%s)",
+                rundir, strerror(errno)
+            );
+            selabel_close(sehandle);
+            close(bfd);
+            return false;
+        }
+        selabel_close(sehandle);
+        if (setfscreatecon_raw(context) < 0) {
+            print_err(
+                "rundir: failed to make rundir %s (%s)",
+                rundir, strerror(errno)
+            );
+            close(bfd);
+            return false;
+        }
+    }
+#endif
+
     /* now create rundir or at least sanitize its perms */
     if (
         (fstatat(bfd, dirbase, &dstat, AT_SYMLINK_NOFOLLOW) < 0) ||
@@ -110,11 +231,34 @@ bool rundir_make(char *rundir, unsigned int uid, unsigned int gid) {
             close(bfd);
             return false;
         }
-    } else if (fchmodat(bfd, dirbase, 0700, AT_SYMLINK_NOFOLLOW) < 0) {
-        print_err("rundir: fchmodat failed for rundir (%s)", strerror(errno));
+    } else {
+        if (fchmodat(bfd, dirbase, 0700, AT_SYMLINK_NOFOLLOW) < 0) {
+            print_err("rundir: fchmodat failed for rundir (%s)", strerror(errno));
+            close(bfd);
+            return false;
+        }
+#ifdef HAVE_SELINUX
+        if (lsetfilecon(rundir, context) < 0) {
+            perror("lsetfilecon");
+            close(bfd);
+            return false;
+        }
+#endif
+    }
+
+#ifdef HAVE_SELINUX
+    // Reset fs creation context so new objects are labelled correctly.
+    if (setfscreatecon(nullptr) < 0) {
+        perror("setfscreatecon");
         close(bfd);
+        free(context);
         return false;
     }
+    if (context) {
+        free(context);
+    }
+#endif
+
     if (fchownat(bfd, dirbase, uid, gid, AT_SYMLINK_NOFOLLOW) < 0) {
         print_err("rundir: fchownat failed for rundir (%s)", strerror(errno));
         close(bfd);

@@ -22,6 +22,12 @@ scdoc_dep = dependency(
     native: true
 )
 
+libselinux_dep = dependency(
+    'libselinux',
+    version: '>=2.1.9',
+    required: get_option('support_selinux')
+)
+
 have_dinit = get_option('dinit').enabled()
 have_runit = get_option('runit').enabled()
 
@@ -31,6 +37,7 @@ conf_data.set_quoted('CONF_PATH', join_paths(
     get_option('prefix'), get_option('sysconfdir'), 'turnstile'
 ))
 conf_data.set10('MANAGE_RUNDIR', get_option('manage_rundir'))
+conf_data.set10('HAVE_SELINUX', libselinux_dep.found())
 
 conf_data.set('HAVE_PAM_MISC', pam_misc_dep.found())
 
@@ -82,7 +89,7 @@ daemon = executable(
     'turnstiled', daemon_sources,
     include_directories: extra_inc,
     install: true,
-    dependencies: [rt_dep, pam_dep, pam_misc_dep],
+    dependencies: [rt_dep, pam_dep, pam_misc_dep, libselinux_dep],
     gnu_symbol_visibility: 'hidden'
 )
 
