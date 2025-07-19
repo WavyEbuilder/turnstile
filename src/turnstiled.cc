@@ -33,6 +33,11 @@
 #include "turnstiled.hh"
 #include "utils.hh"
 
+#ifdef HAVE_SELINUX
+#include <selinux/label.h>
+#include <selinux/selinux.h>
+#endif
+
 #ifndef CONF_PATH
 #error "No CONF_PATH is defined"
 #endif
@@ -159,10 +164,57 @@ static bool srv_start(login &lgn) {
     }
     print_dbg("srv: create readiness pipe");
     unlinkat(lgn.dirfd, "ready", 0);
+#ifdef HAVE_SELINUX
+    // We can't rely on policy transitions to set the user field of the context
+    // correctly as that depends on the seuser db, so calculate the context to
+    // create the runtimedir with ourselves.
+    char *context = nullptr;
+    {
+        struct selabel_handle *sehandle =
+            selabel_open(SELABEL_CTX_FILE, nullptr, 0);
+        if (!sehandle) {
+            print_err("srv: failed to make ready pipe (%s)", strerror(errno));
+            return false;
+        }
+        char ready_path[PATH_MAX];
+        if (const int r = std::snprintf(ready_path, sizeof(ready_path),
+                                        "%s/%s/%u/ready", RUN_PATH, SOCK_DIR, lgn.uid);
+            r < 0 || r >= PATH_MAX) {
+            print_err("srv: failed to make ready pipe (%s)", strerror(errno));
+            selabel_close(sehandle);
+            return false;
+        }
+	if (selabel_lookup_raw(sehandle, &context, ready_path, 0700) < 0) {
+            print_err("srv: failed to make ready pipe (%s)", strerror(errno));
+            selabel_close(sehandle);
+            return false;
+        }
+        selabel_close(sehandle);
+        if (setfscreatecon_raw(context) < 0) {
+            print_err("srv: failed to make ready pipe (%s)", strerror(errno));
+            free(context);
+            return false;
+        }
+    }
+#endif
     if (mkfifoat(lgn.dirfd, "ready", 0700) < 0) {
         print_err("srv: failed to make ready pipe (%s)", strerror(errno));
         return false;
     }
+#ifdef HAVE_SELINUX
+    // Reset fs creation context so new objects are labelled correctly.
+    if (context) {
+        free(context);
+    }
+    if (setfscreatecon(nullptr) < 0) {
+        print_err(
+            "srv: failed to set up ready pipe (%s)", strerror(errno)
+        );
+        unlinkat(lgn.dirfd, "ready", 0);
+        lgn.remove_sdir();
+        return false;
+    }
+#endif
     /* ensure it's owned by user too, and open in nonblocking mode */
     if (fchownat(
         lgn.dirfd, "ready", lgn.uid, lgn.gid, AT_SYMLINK_NOFOLLOW
